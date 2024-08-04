@@ -8,12 +8,13 @@
 # https://arxiv.org/pdf/2205.14135
 # Flash Attention 2
 # https://arxiv.org/pdf/2307.08691
-
+import inspect
 import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from config import GPTConfig
+from config import GPTConfig, GPTHyperParameters, LrConfig
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -115,6 +116,8 @@ class GPT(nn.Module):
 
         # init params
         self.apply(self._init_weights)
+        self.hyper_params = GPTHyperParameters()
+
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -202,21 +205,50 @@ class GPT(nn.Module):
             print(f"{k} {v.shape}")
         return model
 
-def get_lr(it, max_steps=50):
-    """Returns learning rate with 10 steps of linear warmup and decay down"""
-    max_lr = 3e-4
-    min_lr = max_lr * 0.1
-    warmup_steps = 10
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        """"""
+        # starts with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weights tensors in matmul + embeddings decay, all biases and layernorms don`t
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"Num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"Num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"Using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            learning_rate,
+            betas=self.hyper_params.opt_betas,
+            eps=self.hyper_params.opt_eps,
+            fused=use_fused
+        )
+        return optimizer
 
+
+def get_lr(it, lr_config: LrConfig = None):
+    """Returns learning rate with 10 steps of linear warmup and decay down"""
+    if lr_config is None:
+        lr_config = LrConfig()
     # 1) linear warm-up for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it + 1) / warmup_steps
+    if it < lr_config.warmup_steps:
+        return lr_config.max_lr * (it + 1) / lr_config.warmup_steps
     # 2) if it > lr_decay_iters, returns min learning rates
-    if it > max_steps:
-        return min_lr
+    if it > lr_config.max_steps:
+        return lr_config.min_lr
     # 3) in between, use cosine decay down to min lr_rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    decay_ratio = (it - lr_config.warmup_steps) / (lr_config.max_steps - lr_config.warmup_steps)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))       # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
+    return lr_config.min_lr + coeff * (lr_config.max_lr - lr_config.min_lr)
 
