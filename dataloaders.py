@@ -1,6 +1,8 @@
+# Tiny Shakespeare Dataset
+# https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+
 import tiktoken
 import torch
-
 
 class DataLoaderLite:
     def __init__(self, B, T):
