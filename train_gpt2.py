@@ -2,12 +2,15 @@
 # https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
 # Attension Is All You Need:
 # https://arxiv.org/pdf/1706.03762
+# Tiny Shakespeare Dataset
+# https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 import math
 import time
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from dataloaders import DataLoaderLite
 
 print(f"Torch is available: {torch.cuda.is_available()}")
 print(f"Torch version: {torch.__version__}")
@@ -21,6 +24,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -57,6 +61,8 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -102,24 +108,45 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
         # idx is of shape(B, T)
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         # forward the token position embeddings
         pos = torch.arange(0, t, dtype=torch.long, device=idx.device)   # shape (T)
-
         #   forward the GPT model itself
         tok_emb = self.transformer.wte(idx)
         pos_emb = self.transformer.wpe(pos)
         x = tok_emb + pos_emb
         # forward the blocks of transformer
         for block in self.transformer.h:
-            x = block(x) #  TODO ERROR
+            x = block(x)
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -173,21 +200,21 @@ class GPT(nn.Module):
             print(f"{k} {v.shape}")
         return model
 
-
-if __name__ == "__main__":
+def test_pretrained():
+    device = get_available_device()
     num_return_sequences = 5
     max_length = 30
 
     model = GPT.from_pretrained('gpt2')
     model.eval()
-    model.to('cuda')
+    model.to(device)
 
     import tiktoken
     enc = tiktoken.get_encoding('gpt2')
     tokens = enc.encode("Hello, I`m language model,")
-    tokens = torch.tensor(tokens, dtype=torch.long)                 # (8, )
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)    # (5 ,8)
-    x = tokens.to('cuda')
+    tokens = torch.tensor(tokens, dtype=torch.long)  # (8, )
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5 ,8)
+    x = tokens.to(device)
 
     # generate! right now x is (B, T) where  B = 5,  T = 8
     # set the seed to 42
@@ -196,18 +223,18 @@ if __name__ == "__main__":
     while x.size(1) < max_length:
         # forward the model to get the logits
         with torch.no_grad():
-            logits = model(x)           # (B, T, vocab_size)
+            logits = model(x)  # (B, T, vocab_size)
             # take the logits at the last position
-            logits = logits[:, -1, :]   # (B, vocab_size)
+            logits = logits[:, -1, :]  # (B, vocab_size)
             # get the probabilities
             probs = F.softmax(logits, dim=-1)
             # do top-k sampling of 50 (huggingface pipeline default)
             # topk_probs here becomes (5, 50), topk_indices is (5, 50)
             topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
             # select a token  from top-k probabilities
-            ix = torch.multinomial(topk_probs, 1)   # (B, 1)
+            ix = torch.multinomial(topk_probs, 1)  # (B, 1)
             # gather the corresponding indices
-            xcol = torch.gather(topk_indices, -1, ix)   # (B, 1)
+            xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
             # append to the sequence
             x = torch.cat((x, xcol), dim=1)
 
@@ -216,4 +243,46 @@ if __name__ == "__main__":
         tokens = x[i, :max_length].tolist()
         decoded = enc.decode(tokens)
         print(">", decoded)
+    print("SUCCESS, yeah!")
+
+def get_available_device():
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"Using device: {device}")
+    return device
+
+
+if __name__ == "__main__":
+
+    device = get_available_device()
+    num_return_sequences = 5
+    max_length = 30
+
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+
+    train_loader = DataLoaderLite(4, 32)
+    # get logits
+    model = GPT(GPTConfig())
+    model.to(device)
+    #logits, loss = model(x, y)
+
+    # optimazer
+    optimazer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    steps = 50
+    for i in range(steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimazer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimazer.step()
+        print(f"Step({i}/{steps}), loss: {loss.item()}")
+    print(loss)
+
+    print(logits.shape)
     print("SUCCESS, yeah!")
